@@ -1,5 +1,3 @@
-// Supabase schema types — keep in sync with migrations.
-
 export type Json =
   | string
   | number
@@ -18,6 +16,7 @@ export interface Database {
           invite_code: string;
           created_by: string;
           created_at: string;
+          pin_hash: string | null;
         };
         Insert: {
           id?: string;
@@ -25,6 +24,7 @@ export interface Database {
           invite_code: string;
           created_by: string;
           created_at?: string;
+          pin_hash?: string | null;
         };
         Update: {
           id?: string;
@@ -32,6 +32,7 @@ export interface Database {
           invite_code?: string;
           created_by?: string;
           created_at?: string;
+          pin_hash?: string | null;
         };
         Relationships: [];
       };
@@ -62,10 +63,38 @@ export interface Database {
         };
         Relationships: [];
       };
+      study_boards: {
+        Row: {
+          id: string;
+          room_id: string;
+          name: string;
+          position: number;
+          created_by: string;
+          created_at: string;
+        };
+        Insert: {
+          id?: string;
+          room_id: string;
+          name: string;
+          position?: number;
+          created_by: string;
+          created_at?: string;
+        };
+        Update: {
+          id?: string;
+          room_id?: string;
+          name?: string;
+          position?: number;
+          created_by?: string;
+          created_at?: string;
+        };
+        Relationships: [];
+      };
       study_board_items: {
         Row: {
           id: string;
           room_id: string;
+          board_id: string;
           type: string;
           data: Json;
           created_by: string;
@@ -76,6 +105,7 @@ export interface Database {
         Insert: {
           id?: string;
           room_id: string;
+          board_id: string;
           type: string;
           data: Json;
           created_by: string;
@@ -86,12 +116,73 @@ export interface Database {
         Update: {
           id?: string;
           room_id?: string;
+          board_id?: string;
           type?: string;
           data?: Json;
           created_by?: string;
           updated_by?: string;
           created_at?: string;
           updated_at?: string;
+        };
+        Relationships: [];
+      };
+      study_chat_messages: {
+        Row: {
+          id: string;
+          room_id: string;
+          user_id: string;
+          display_name: string;
+          color: string;
+          text: string;
+          created_at: string;
+        };
+        Insert: {
+          id?: string;
+          room_id: string;
+          user_id: string;
+          display_name: string;
+          color: string;
+          text: string;
+          created_at?: string;
+        };
+        Update: {
+          id?: string;
+          room_id?: string;
+          user_id?: string;
+          display_name?: string;
+          color?: string;
+          text?: string;
+          created_at?: string;
+        };
+        Relationships: [];
+      };
+      study_board_snapshots: {
+        Row: {
+          id: string;
+          room_id: string;
+          board_id: string;
+          label: string;
+          items_json: Json;
+          created_by: string;
+          created_at: string;
+        };
+        Insert: {
+          id?: string;
+          room_id: string;
+          board_id: string;
+          label: string;
+          items_json: Json;
+          created_by: string;
+          created_at?: string;
+        };
+        Update: {
+          id?: string;
+          room_id?: string;
+          board_id?: string;
+          label?: string;
+          items_json?: Json;
+          created_by?: string;
+          created_at?: string;
         };
         Relationships: [];
       };
@@ -106,6 +197,7 @@ export interface Database {
           invite_code: string;
           created_by: string;
           created_at: string;
+          pin_hash: string | null;
         }>;
       };
       is_room_member: {
@@ -119,6 +211,7 @@ export interface Database {
           p_user_id: string;
           p_display_name: string;
           p_color: string;
+          p_pin_hash?: string | null;
         };
         Returns: Json;
       };
@@ -128,7 +221,20 @@ export interface Database {
           p_user_id: string;
           p_display_name: string;
           p_color: string;
+          p_pin?: string | null;
         };
+        Returns: Json;
+      };
+      create_board: {
+        Args: { p_room_id: string; p_name: string; p_user_id: string };
+        Returns: Json;
+      };
+      restore_snapshot: {
+        Args: { p_snapshot_id: string; p_user_id: string };
+        Returns: Json;
+      };
+      set_room_pin: {
+        Args: { p_room_id: string; p_user_id: string; p_pin_hash: string | null };
         Returns: Json;
       };
     };

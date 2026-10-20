@@ -13,10 +13,14 @@
     "@supabase/supabase-js": "^2.118.0",
     "konva": "^10.9.0",
     "nanoid": "^6.0.2",
+    "pdfjs-dist": "^6.4.299",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
+    "react-hot-toast": "^2.6.1",
     "react-konva": "^19.3.2",
-    "react-router-dom": "^7.18.4"
+    "react-router-dom": "^7.18.4",
+    "use-image": "^1.1.4",
+    "zustand": "^5.0.15"
   },
   "devDependencies": {
     "@types/node": "^24.13.3",
