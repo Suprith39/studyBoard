@@ -10,11 +10,15 @@ import type {
   RoomSession,
 } from '../types/board';
 import { STICKY_COLORS } from '../lib/colors';
+import { createBoardItem, updateBoardItem } from '../lib/boardService';
 import {
-  createBoardItem,
-  updateBoardItem,
-} from '../lib/boardService';
-import { broadcastCursor } from '../lib/presenceService';
+  broadcastCursor,
+  broadcastStrokeProgress,
+  broadcastStrokeEnd,
+  broadcastStickyDrag,
+  type RemoteStrokeProgress,
+  type RemoteStickyDrag,
+} from '../lib/presenceService';
 import type { RealtimeChannel } from '@supabase/supabase-js';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -22,7 +26,7 @@ const GRID_SIZE = 30;
 const DEFAULT_STICKY_WIDTH = 180;
 const DEFAULT_STICKY_HEIGHT = 140;
 const STROKE_WIDTH = 3;
-const CURSOR_THROTTLE_MS = 40; // ~25fps
+const BROADCAST_THROTTLE_MS = 32; // ~30fps
 
 // ─── Props ────────────────────────────────────────────────────────────────────
 interface Props {
@@ -30,11 +34,13 @@ interface Props {
   tool: Tool;
   color: string;
   remoteCursors: CursorPosition[];
+  remoteStrokes: Map<string, RemoteStrokeProgress>;
+  remoteStickyDrags: Map<string, RemoteStickyDrag>;
   session: RoomSession | null;
   channel: RealtimeChannel | null;
   onItemsChange: (updater: (prev: BoardItem[]) => BoardItem[]) => void;
   onUndo: (itemId: string) => void;
-  undoStack: string[]; // ids we created locally
+  undoStack: string[];
 }
 
 // ─── Grid background ──────────────────────────────────────────────────────────
@@ -42,15 +48,13 @@ function GridLayer({ width, height }: { width: number; height: number }) {
   const dots: React.ReactNode[] = [];
   for (let x = GRID_SIZE; x < width; x += GRID_SIZE) {
     for (let y = GRID_SIZE; y < height; y += GRID_SIZE) {
-      dots.push(
-        <Circle key={`${x}-${y}`} x={x} y={y} radius={1} fill="#cbd5e1" />
-      );
+      dots.push(<Circle key={`${x}-${y}`} x={x} y={y} radius={1} fill="#cbd5e1" />);
     }
   }
   return <Layer listening={false}>{dots}</Layer>;
 }
 
-// ─── Sticky note editor overlay ───────────────────────────────────────────────
+// ─── Sticky editor overlay ────────────────────────────────────────────────────
 interface StickyEditorProps {
   item: BoardItem;
   stageRef: React.RefObject<Konva.Stage | null>;
@@ -62,7 +66,6 @@ function StickyEditor({ item, stageRef, onSave, onClose }: StickyEditorProps) {
   const data = item.data as StickyData;
   const [text, setText] = useState(data.text);
 
-  // Position the textarea over the sticky on the canvas
   const stage = stageRef.current;
   const containerRect = stage?.container().getBoundingClientRect();
   const left = (containerRect?.left ?? 0) + data.x;
@@ -100,6 +103,8 @@ export function Whiteboard({
   tool,
   color,
   remoteCursors,
+  remoteStrokes,
+  remoteStickyDrags,
   session,
   channel,
   onItemsChange,
@@ -110,7 +115,7 @@ export function Whiteboard({
   const [isDrawing, setIsDrawing] = useState(false);
   const currentStrokeId = useRef<string | null>(null);
   const currentPoints = useRef<number[]>([]);
-  const lastCursorBroadcast = useRef(0);
+  const lastBroadcast = useRef(0);
   const [editingSticky, setEditingSticky] = useState<BoardItem | null>(null);
   const [draggingStickyId, setDraggingStickyId] = useState<string | null>(null);
 
@@ -126,47 +131,24 @@ export function Whiteboard({
     return () => ro.disconnect();
   }, []);
 
-  // ── Keyboard shortcut: Ctrl/Cmd+Z ─────────────────────────────────────────
-  useEffect(() => {
-    const handleKey = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
-        // handled by parent
-      }
-    };
-    window.addEventListener('keydown', handleKey);
-    return () => window.removeEventListener('keydown', handleKey);
+  // ── Throttled broadcast helper ─────────────────────────────────────────────
+  const canBroadcast = useCallback(() => {
+    const now = Date.now();
+    if (now - lastBroadcast.current < BROADCAST_THROTTLE_MS) return false;
+    lastBroadcast.current = now;
+    return true;
   }, []);
 
-  // ── Cursor broadcast ───────────────────────────────────────────────────────
-  const broadcastCursorThrottled = useCallback((x: number, y: number) => {
-    if (!channel || !session) return;
-    const now = Date.now();
-    if (now - lastCursorBroadcast.current < CURSOR_THROTTLE_MS) return;
-    lastCursorBroadcast.current = now;
-    broadcastCursor(channel, {
-      user_id: session.userId,
-      display_name: session.member.display_name,
-      color: session.member.color,
-      x,
-      y,
-    });
-  }, [channel, session]);
-
   // ── Pointer position helper ────────────────────────────────────────────────
-  const getPointerPos = () => {
-    const stage = stageRef.current;
-    if (!stage) return null;
-    return stage.getPointerPosition();
-  };
+  const getPointerPos = () => stageRef.current?.getPointerPosition() ?? null;
 
-  // ── Draw: pointer down ──────────────────────────────────────────────────────
+  // ── Draw: pointer down ─────────────────────────────────────────────────────
   const handlePointerDown = () => {
     if (tool !== 'draw') return;
     const pos = getPointerPos();
     if (!pos) return;
     setIsDrawing(true);
     currentPoints.current = [pos.x, pos.y];
-    // Optimistic local stroke — will get a real id on save
     const tempId = `tmp-${Date.now()}`;
     currentStrokeId.current = tempId;
     onItemsChange(prev => [
@@ -184,11 +166,30 @@ export function Whiteboard({
     ]);
   };
 
-  // ── Draw: pointer move ──────────────────────────────────────────────────────
+  // ── Draw: pointer move ─────────────────────────────────────────────────────
   const handlePointerMove = () => {
     const pos = getPointerPos();
     if (!pos) return;
-    broadcastCursorThrottled(pos.x, pos.y);
+
+    // Cursor + stroke broadcast share the same throttle window
+    if (channel && session && canBroadcast()) {
+      broadcastCursor(channel, {
+        user_id: session.userId,
+        display_name: session.member.display_name,
+        color: session.member.color,
+        x: pos.x,
+        y: pos.y,
+      });
+
+      if (isDrawing && tool === 'draw') {
+        broadcastStrokeProgress(channel, {
+          user_id: session.userId,
+          color,
+          strokeWidth: STROKE_WIDTH,
+          points: [...currentPoints.current, pos.x, pos.y],
+        });
+      }
+    }
 
     if (!isDrawing || tool !== 'draw') return;
     currentPoints.current = [...currentPoints.current, pos.x, pos.y];
@@ -197,22 +198,22 @@ export function Whiteboard({
     onItemsChange(prev =>
       prev.map(item =>
         item.id === tempId
-          ? {
-              ...item,
-              data: {
-                ...(item.data as StrokeData),
-                points: [...currentPoints.current],
-              },
-            }
+          ? { ...item, data: { ...(item.data as StrokeData), points: [...currentPoints.current] } }
           : item
       )
     );
   };
 
-  // ── Draw: pointer up ────────────────────────────────────────────────────────
+  // ── Draw: pointer up ───────────────────────────────────────────────────────
   const handlePointerUp = async () => {
     if (!isDrawing || tool !== 'draw') return;
     setIsDrawing(false);
+
+    // Tell remotes the stroke is done
+    if (channel && session) {
+      broadcastStrokeEnd(channel, session.userId);
+    }
+
     const tempId = currentStrokeId.current;
     currentStrokeId.current = null;
     if (!tempId || !session) return;
@@ -225,20 +226,16 @@ export function Whiteboard({
 
     try {
       const saved = await createBoardItem(session.room.id, session.userId, 'stroke', strokeData);
-      // Replace temp item with real item
-      onItemsChange(prev =>
-        prev.map(item => (item.id === tempId ? saved : item))
-      );
+      onItemsChange(prev => prev.map(item => (item.id === tempId ? saved : item)));
     } catch {
-      // Remove failed stroke
       onItemsChange(prev => prev.filter(item => item.id !== tempId));
     }
   };
 
-  // ── Sticky: place on canvas click ───────────────────────────────────────────
+  // ── Sticky: place on canvas click ─────────────────────────────────────────
   const handleStageClick = async (e: Konva.KonvaEventObject<MouseEvent | TouchEvent>) => {
     if (tool !== 'sticky') return;
-    if (e.target !== stageRef.current) return; // only on empty canvas
+    if (e.target !== stageRef.current) return;
     const pos = getPointerPos();
     if (!pos || !session) return;
 
@@ -255,23 +252,32 @@ export function Whiteboard({
       const saved = await createBoardItem(session.room.id, session.userId, 'sticky', stickyData);
       onItemsChange(prev => [...prev, saved]);
       setEditingSticky(saved);
-    } catch {
-      // ignore
-    }
+    } catch { /* ignore */ }
   };
 
-  // ── Sticky: drag end ────────────────────────────────────────────────────────
+  // ── Sticky: live drag broadcast ────────────────────────────────────────────
+  const handleStickyDragMove = useCallback(
+    (e: Konva.KonvaEventObject<DragEvent>, itemId: string) => {
+      if (!channel || !session) return;
+      if (!canBroadcast()) return;
+      broadcastStickyDrag(channel, {
+        user_id: session.userId,
+        item_id: itemId,
+        x: e.target.x(),
+        y: e.target.y(),
+      });
+    },
+    [channel, session, canBroadcast]
+  );
+
+  // ── Sticky: drag end (persist) ─────────────────────────────────────────────
   const handleStickyDragEnd = async (
     e: Konva.KonvaEventObject<DragEvent>,
     item: BoardItem
   ) => {
     setDraggingStickyId(null);
     const data = item.data as StickyData;
-    const newData: StickyData = {
-      ...data,
-      x: e.target.x(),
-      y: e.target.y(),
-    };
+    const newData: StickyData = { ...data, x: e.target.x(), y: e.target.y() };
 
     onItemsChange(prev =>
       prev.map(i => (i.id === item.id ? { ...i, data: newData } : i))
@@ -281,14 +287,11 @@ export function Whiteboard({
     try {
       await updateBoardItem(item.id, session.userId, newData);
     } catch {
-      // revert
-      onItemsChange(prev =>
-        prev.map(i => (i.id === item.id ? { ...i, data } : i))
-      );
+      onItemsChange(prev => prev.map(i => (i.id === item.id ? { ...i, data } : i)));
     }
   };
 
-  // ── Save sticky text ────────────────────────────────────────────────────────
+  // ── Save sticky text ───────────────────────────────────────────────────────
   const handleStickyTextSave = async (text: string) => {
     if (!editingSticky || !session) return;
     const data = editingSticky.data as StickyData;
@@ -301,14 +304,12 @@ export function Whiteboard({
     try {
       await updateBoardItem(editingSticky.id, session.userId, newData);
     } catch {
-      // revert
       onItemsChange(prev =>
         prev.map(i => (i.id === editingSticky.id ? { ...i, data } : i))
       );
     }
   };
 
-  // ── Cursor style ────────────────────────────────────────────────────────────
   const getCursor = () => {
     if (tool === 'draw') return 'crosshair';
     if (tool === 'sticky') return 'cell';
@@ -316,11 +317,7 @@ export function Whiteboard({
   };
 
   return (
-    <div
-      ref={containerRef}
-      className="whiteboard-container"
-      style={{ cursor: getCursor() }}
-    >
+    <div ref={containerRef} className="whiteboard-container" style={{ cursor: getCursor() }}>
       <Stage
         ref={stageRef}
         width={size.width}
@@ -335,7 +332,7 @@ export function Whiteboard({
         {/* Grid */}
         <GridLayer width={size.width} height={size.height} />
 
-        {/* Board items */}
+        {/* Committed board items */}
         <Layer>
           {items.map(item => {
             if (item.type === 'stroke') {
@@ -356,38 +353,32 @@ export function Whiteboard({
             }
             if (item.type === 'sticky') {
               const d = item.data as StickyData;
-              const isDragging = draggingStickyId === item.id;
+              // If this sticky is being dragged live by a remote user, use their position
+              const liveDrag = remoteStickyDrags.get(item.id);
+              const displayX = liveDrag ? liveDrag.x : d.x;
+              const displayY = liveDrag ? liveDrag.y : d.y;
+              const isDraggingLocal = draggingStickyId === item.id;
+
               return (
                 <Group
                   key={item.id}
-                  x={d.x}
-                  y={d.y}
+                  x={displayX}
+                  y={displayY}
                   draggable={tool === 'select'}
                   onDragStart={() => setDraggingStickyId(item.id)}
+                  onDragMove={e => handleStickyDragMove(e, item.id)}
                   onDragEnd={e => handleStickyDragEnd(e, item)}
                   onDblClick={() => setEditingSticky(item)}
                   onDblTap={() => setEditingSticky(item)}
-                  shadowBlur={isDragging ? 16 : 4}
-                  shadowOpacity={isDragging ? 0.3 : 0.15}
+                  shadowBlur={isDraggingLocal || !!liveDrag ? 16 : 4}
+                  shadowOpacity={isDraggingLocal || !!liveDrag ? 0.3 : 0.15}
                   shadowColor="#000"
-                  shadowOffsetY={isDragging ? 8 : 2}
+                  shadowOffsetY={isDraggingLocal || !!liveDrag ? 8 : 2}
                 >
-                  <Rect
-                    width={d.width}
-                    height={d.height}
-                    fill={d.color}
-                    cornerRadius={4}
-                  />
-                  {/* Sticky top accent */}
-                  <Rect
-                    width={d.width}
-                    height={6}
-                    fill={darken(d.color, 20)}
-                    cornerRadius={[4, 4, 0, 0]}
-                  />
+                  <Rect width={d.width} height={d.height} fill={d.color} cornerRadius={4} />
+                  <Rect width={d.width} height={6} fill={darken(d.color, 20)} cornerRadius={[4, 4, 0, 0]} />
                   <Text
-                    x={8}
-                    y={16}
+                    x={8} y={16}
                     width={d.width - 16}
                     height={d.height - 24}
                     text={d.text || (editingSticky?.id === item.id ? '' : 'Double-click to edit')}
@@ -397,6 +388,17 @@ export function Whiteboard({
                     wrap="word"
                     ellipsis
                   />
+                  {/* Remote drag indicator badge */}
+                  {liveDrag && (
+                    <Rect
+                      x={d.width - 10}
+                      y={-6}
+                      width={10}
+                      height={10}
+                      fill="#6366f1"
+                      cornerRadius={5}
+                    />
+                  )}
                 </Group>
               );
             }
@@ -404,11 +406,27 @@ export function Whiteboard({
           })}
         </Layer>
 
+        {/* Remote in-progress strokes (ephemeral, never saved) */}
+        <Layer listening={false}>
+          {Array.from(remoteStrokes.values()).map(stroke => (
+            <Line
+              key={stroke.user_id}
+              points={stroke.points}
+              stroke={stroke.color}
+              strokeWidth={stroke.strokeWidth}
+              tension={0.5}
+              lineCap="round"
+              lineJoin="round"
+              opacity={0.85}
+              globalCompositeOperation="source-over"
+            />
+          ))}
+        </Layer>
+
         {/* Remote cursors */}
         <Layer listening={false}>
           {remoteCursors.map(cursor => (
             <Group key={cursor.user_id} x={cursor.x} y={cursor.y}>
-              {/* Cursor arrow */}
               <Line
                 points={[0, 0, 0, 16, 4, 12, 8, 20, 10, 18, 6, 10, 12, 10]}
                 closed
@@ -416,18 +434,15 @@ export function Whiteboard({
                 stroke="#fff"
                 strokeWidth={1}
               />
-              {/* Name label */}
               <Rect
-                x={12}
-                y={14}
+                x={12} y={14}
                 width={cursor.display_name.length * 7 + 8}
                 height={20}
                 fill={cursor.color}
                 cornerRadius={4}
               />
               <Text
-                x={16}
-                y={18}
+                x={16} y={18}
                 text={cursor.display_name}
                 fontSize={11}
                 fill="#fff"
@@ -439,7 +454,6 @@ export function Whiteboard({
         </Layer>
       </Stage>
 
-      {/* Textarea overlay for sticky editing */}
       {editingSticky && (
         <StickyEditor
           item={editingSticky}

@@ -10,6 +10,7 @@ import type {
   SyncStatus,
   Tool,
 } from '../types/board';
+import type { RemoteStrokeProgress, RemoteStickyDrag } from '../lib/presenceService';
 import { STROKE_COLORS } from '../lib/colors';
 import { loadRoom, getMyMembership } from '../lib/roomService';
 import {
@@ -19,10 +20,7 @@ import {
   deleteBoardItem,
   type BoardChangeHandler,
 } from '../lib/boardService';
-import {
-  createRoomChannel,
-  leaveRoomChannel,
-} from '../lib/presenceService';
+import { createRoomChannel, leaveRoomChannel } from '../lib/presenceService';
 import { supabase } from '../lib/supabase';
 
 import { TopBar } from '../components/TopBar';
@@ -38,6 +36,8 @@ export function RoomPage() {
   const [items, setItems] = useState<BoardItem[]>([]);
   const [participants, setParticipants] = useState<PresenceState[]>([]);
   const [remoteCursors, setRemoteCursors] = useState<CursorPosition[]>([]);
+  const [remoteStrokes, setRemoteStrokes] = useState<Map<string, RemoteStrokeProgress>>(new Map());
+  const [remoteStickyDrags, setRemoteStickyDrags] = useState<Map<string, RemoteStickyDrag>>(new Map());
   const [tool, setTool] = useState<Tool>('draw');
   const [color, setColor] = useState(STROKE_COLORS[0]);
   const [undoStack, setUndoStack] = useState<string[]>([]);
@@ -45,15 +45,11 @@ export function RoomPage() {
 
   const boardChannelRef = useRef<ReturnType<typeof subscribeToBoardItems> | null>(null);
   const presenceChannelRef = useRef<RealtimeChannel | null>(null);
-
-  // ── Remove stale cursors after 5s of inactivity ────────────────────────────
   const cursorTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
 
+  // ── Remote cursor stale-cleanup ────────────────────────────────────────────
   const handleRemoteCursor = useCallback((cursor: CursorPosition) => {
-    setRemoteCursors(prev => {
-      const next = prev.filter(c => c.user_id !== cursor.user_id);
-      return [...next, cursor];
-    });
+    setRemoteCursors(prev => [...prev.filter(c => c.user_id !== cursor.user_id), cursor]);
     const existing = cursorTimers.current.get(cursor.user_id);
     if (existing) clearTimeout(existing);
     cursorTimers.current.set(
@@ -65,11 +61,35 @@ export function RoomPage() {
     );
   }, []);
 
+  // ── Remote stroke progress ─────────────────────────────────────────────────
+  const handleStrokeProgress = useCallback(
+    (stroke: RemoteStrokeProgress | null, userId: string) => {
+      setRemoteStrokes(prev => {
+        const next = new Map(prev);
+        if (stroke === null) {
+          next.delete(userId);
+        } else {
+          next.set(userId, stroke);
+        }
+        return next;
+      });
+    },
+    []
+  );
+
+  // ── Remote sticky drag ─────────────────────────────────────────────────────
+  const handleStickyDrag = useCallback((drag: RemoteStickyDrag) => {
+    setRemoteStickyDrags(prev => {
+      const next = new Map(prev);
+      next.set(drag.item_id, drag);
+      return next;
+    });
+  }, []);
+
   // ── Board change handler ───────────────────────────────────────────────────
   const handleBoardChange = useCallback<BoardChangeHandler>(change => {
     if (change.event === 'INSERT') {
       setItems(prev => {
-        // Don't add if already present (e.g. our own optimistic item)
         if (prev.some(i => i.id === change.item.id)) return prev;
         return [...prev, change.item];
       });
@@ -77,30 +97,32 @@ export function RoomPage() {
       setItems(prev =>
         prev.map(i => {
           if (i.id !== change.item.id) return i;
-          // Latest-write-wins: only update if remote is newer
           if (change.item.updated_at >= i.updated_at) return change.item;
           return i;
         })
       );
+      // Clear any live sticky drag for this item since it's now committed
+      setRemoteStickyDrags(prev => {
+        const next = new Map(prev);
+        next.delete(change.item.id);
+        return next;
+      });
     } else if (change.event === 'DELETE') {
       setItems(prev => prev.filter(i => i.id !== change.itemId));
     }
   }, []);
 
-  // ── Initial load + subscription setup ─────────────────────────────────────
+  // ── Setup ──────────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!roomId) { navigate('/'); return; }
-
     let cancelled = false;
 
     const setup = async () => {
       setSyncStatus('connecting');
       try {
-        // Ensure auth
         const { data: { user } } = await supabase.auth.getUser();
         if (!user) { navigate('/'); return; }
 
-        // Load room
         const room = await loadRoom(roomId);
         const member = await getMyMembership(roomId);
         if (!member) {
@@ -108,40 +130,31 @@ export function RoomPage() {
           setSyncStatus('error');
           return;
         }
-
         if (cancelled) return;
 
         const sess: RoomSession = { room, member, userId: user.id };
         setSession(sess);
 
-        // Load board snapshot
         const boardItems = await loadBoardItems(roomId);
         if (cancelled) return;
         setItems(boardItems);
 
-        // Subscribe to board changes
         boardChannelRef.current = subscribeToBoardItems(roomId, handleBoardChange);
 
-        // Set up presence + cursor channel
         presenceChannelRef.current = createRoomChannel(
           roomId,
-          {
-            user_id: user.id,
-            display_name: member.display_name,
-            color: member.color,
-            online_at: new Date().toISOString(),
-          },
+          { user_id: user.id, display_name: member.display_name, color: member.color, online_at: new Date().toISOString() },
           setParticipants,
-          handleRemoteCursor
+          handleRemoteCursor,
+          handleStrokeProgress,
+          handleStickyDrag,
         );
 
         setSyncStatus('live');
       } catch (err) {
         if (cancelled) return;
         const msg = err instanceof Error ? err.message : 'Failed to load room';
-        if (msg.includes('not found') || msg.includes('Invalid')) {
-          setError(msg);
-        }
+        if (msg.includes('not found') || msg.includes('Invalid')) setError(msg);
         setSyncStatus('error');
       }
     };
@@ -150,15 +163,11 @@ export function RoomPage() {
 
     return () => {
       cancelled = true;
-      if (boardChannelRef.current) {
-        supabase.removeChannel(boardChannelRef.current);
-      }
-      if (presenceChannelRef.current) {
-        leaveRoomChannel(presenceChannelRef.current);
-      }
+      if (boardChannelRef.current) supabase.removeChannel(boardChannelRef.current);
+      if (presenceChannelRef.current) leaveRoomChannel(presenceChannelRef.current);
       cursorTimers.current.forEach(t => clearTimeout(t));
     };
-  }, [roomId, navigate, handleBoardChange, handleRemoteCursor]);
+  }, [roomId, navigate, handleBoardChange, handleRemoteCursor, handleStrokeProgress, handleStickyDrag]);
 
   // ── Network status ─────────────────────────────────────────────────────────
   useEffect(() => {
@@ -177,21 +186,16 @@ export function RoomPage() {
     if (undoStack.length === 0) return;
     const lastId = undoStack[undoStack.length - 1];
     setUndoStack(prev => prev.slice(0, -1));
-    // Only delete if the item still belongs to us and hasn't been edited by someone else
     const item = items.find(i => i.id === lastId);
     if (!item || !session) return;
-    if (item.updated_by !== session.userId) return; // teammate edited it — skip
+    if (item.updated_by !== session.userId) return;
     await deleteBoardItem(lastId);
     setItems(prev => prev.filter(i => i.id !== lastId));
   }, [undoStack, items, session]);
 
-  // ── Keyboard undo ──────────────────────────────────────────────────────────
   useEffect(() => {
     const handle = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
-        e.preventDefault();
-        handleUndo();
-      }
+      if ((e.ctrlKey || e.metaKey) && e.key === 'z') { e.preventDefault(); handleUndo(); }
     };
     window.addEventListener('keydown', handle);
     return () => window.removeEventListener('keydown', handle);
@@ -205,9 +209,7 @@ export function RoomPage() {
       await clearBoardItems(session.room.id);
       setItems([]);
       setUndoStack([]);
-    } catch {
-      // ignore — realtime will handle
-    }
+    } catch { /* realtime will sync */ }
   };
 
   // ── Track locally-created items for undo ──────────────────────────────────
@@ -215,16 +217,10 @@ export function RoomPage() {
     (updater: (prev: BoardItem[]) => BoardItem[]) => {
       setItems(prev => {
         const next = updater(prev);
-        // If a new item was added that has a real id (not tmp-), push to undo stack
         const added = next.find(
-          n =>
-            !n.id.startsWith('tmp-') &&
-            !prev.some(p => p.id === n.id) &&
-            n.created_by === session?.userId
+          n => !n.id.startsWith('tmp-') && !prev.some(p => p.id === n.id) && n.created_by === session?.userId
         );
-        if (added) {
-          setUndoStack(s => [...s.slice(-19), added.id]); // max 20
-        }
+        if (added) setUndoStack(s => [...s.slice(-19), added.id]);
         return next;
       });
     },
@@ -237,14 +233,10 @@ export function RoomPage() {
       <div className="error-page">
         <div className="error-card">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="48" height="48" aria-hidden="true">
-            <circle cx="12" cy="12" r="10" />
-            <line x1="12" y1="8" x2="12" y2="12" />
-            <line x1="12" y1="16" x2="12.01" y2="16" />
+            <circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" />
           </svg>
           <h2>{error}</h2>
-          <button className="btn btn--primary" onClick={() => navigate('/')}>
-            Go home
-          </button>
+          <button className="btn btn--primary" onClick={() => navigate('/')}>Go home</button>
         </div>
       </div>
     );
@@ -264,6 +256,8 @@ export function RoomPage() {
           tool={tool}
           color={color}
           remoteCursors={remoteCursors.filter(c => c.user_id !== session?.userId)}
+          remoteStrokes={remoteStrokes}
+          remoteStickyDrags={remoteStickyDrags}
           session={session}
           channel={presenceChannelRef.current}
           onItemsChange={handleItemsChange}
