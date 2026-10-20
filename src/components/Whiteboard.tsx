@@ -26,7 +26,8 @@ const GRID_SIZE = 30;
 const DEFAULT_STICKY_WIDTH = 180;
 const DEFAULT_STICKY_HEIGHT = 140;
 const STROKE_WIDTH = 3;
-const BROADCAST_THROTTLE_MS = 32; // ~30fps
+const CURSOR_THROTTLE_MS = 50;   // cursor: ~20fps is fine
+// Stroke progress: NO throttle — send every point for maximum smoothness
 
 // ─── Props ────────────────────────────────────────────────────────────────────
 interface Props {
@@ -65,7 +66,6 @@ interface StickyEditorProps {
 function StickyEditor({ item, stageRef, onSave, onClose }: StickyEditorProps) {
   const data = item.data as StickyData;
   const [text, setText] = useState(data.text);
-
   const stage = stageRef.current;
   const containerRect = stage?.container().getBoundingClientRect();
   const left = (containerRect?.left ?? 0) + data.x;
@@ -80,13 +80,7 @@ function StickyEditor({ item, stageRef, onSave, onClose }: StickyEditorProps) {
     <textarea
       autoFocus
       className="sticky-editor"
-      style={{
-        left,
-        top,
-        width: data.width - 16,
-        height: data.height - 32,
-        backgroundColor: data.color,
-      }}
+      style={{ left, top, width: data.width - 16, height: data.height - 32, backgroundColor: data.color }}
       value={text}
       onChange={e => setText(e.target.value)}
       onKeyDown={handleKeyDown}
@@ -112,12 +106,21 @@ export function Whiteboard({
   const containerRef = useRef<HTMLDivElement>(null);
   const stageRef = useRef<Konva.Stage>(null);
   const [size, setSize] = useState({ width: 800, height: 600 });
-  const [isDrawing, setIsDrawing] = useState(false);
+
+  // Drawing state — use refs so updates don't trigger re-renders during stroke
+  const isDrawingRef = useRef(false);
   const currentStrokeId = useRef<string | null>(null);
   const currentPoints = useRef<number[]>([]);
-  const lastBroadcast = useRef(0);
+  // Mirror in state only for the local live preview line
+  const [localPoints, setLocalPoints] = useState<number[]>([]);
+  const [localColor, setLocalColor] = useState(color);
+
+  const lastCursorBroadcast = useRef(0);
   const [editingSticky, setEditingSticky] = useState<BoardItem | null>(null);
   const [draggingStickyId, setDraggingStickyId] = useState<string | null>(null);
+
+  // Keep localColor in sync (color can change between strokes)
+  useEffect(() => { setLocalColor(color); }, [color]);
 
   // ── Resize observer ────────────────────────────────────────────────────────
   useEffect(() => {
@@ -131,26 +134,23 @@ export function Whiteboard({
     return () => ro.disconnect();
   }, []);
 
-  // ── Throttled broadcast helper ─────────────────────────────────────────────
-  const canBroadcast = useCallback(() => {
-    const now = Date.now();
-    if (now - lastBroadcast.current < BROADCAST_THROTTLE_MS) return false;
-    lastBroadcast.current = now;
-    return true;
-  }, []);
-
-  // ── Pointer position helper ────────────────────────────────────────────────
   const getPointerPos = () => stageRef.current?.getPointerPosition() ?? null;
 
   // ── Draw: pointer down ─────────────────────────────────────────────────────
-  const handlePointerDown = () => {
+  const handlePointerDown = useCallback(() => {
     if (tool !== 'draw') return;
     const pos = getPointerPos();
     if (!pos) return;
-    setIsDrawing(true);
+
+    isDrawingRef.current = true;
     currentPoints.current = [pos.x, pos.y];
+    setLocalPoints([pos.x, pos.y]);
+    setLocalColor(color);
+
     const tempId = `tmp-${Date.now()}`;
     currentStrokeId.current = tempId;
+
+    // Add a placeholder item — we'll replace it on pointer-up
     onItemsChange(prev => [
       ...prev,
       {
@@ -164,52 +164,56 @@ export function Whiteboard({
         updated_at: new Date().toISOString(),
       },
     ]);
-  };
+  }, [tool, color, session, onItemsChange]);
 
   // ── Draw: pointer move ─────────────────────────────────────────────────────
-  const handlePointerMove = () => {
+  const handlePointerMove = useCallback(() => {
     const pos = getPointerPos();
     if (!pos) return;
 
-    // Cursor + stroke broadcast share the same throttle window
-    if (channel && session && canBroadcast()) {
-      broadcastCursor(channel, {
-        user_id: session.userId,
-        display_name: session.member.display_name,
-        color: session.member.color,
-        x: pos.x,
-        y: pos.y,
-      });
-
-      if (isDrawing && tool === 'draw') {
-        broadcastStrokeProgress(channel, {
+    // Throttled cursor broadcast (independent of stroke)
+    if (channel && session) {
+      const now = Date.now();
+      if (now - lastCursorBroadcast.current >= CURSOR_THROTTLE_MS) {
+        lastCursorBroadcast.current = now;
+        broadcastCursor(channel, {
           user_id: session.userId,
-          color,
-          strokeWidth: STROKE_WIDTH,
-          points: [...currentPoints.current, pos.x, pos.y],
+          display_name: session.member.display_name,
+          color: session.member.color,
+          x: pos.x,
+          y: pos.y,
         });
       }
     }
 
-    if (!isDrawing || tool !== 'draw') return;
+    if (!isDrawingRef.current || tool !== 'draw') return;
+
+    // Append point
     currentPoints.current = [...currentPoints.current, pos.x, pos.y];
-    const tempId = currentStrokeId.current;
-    if (!tempId) return;
-    onItemsChange(prev =>
-      prev.map(item =>
-        item.id === tempId
-          ? { ...item, data: { ...(item.data as StrokeData), points: [...currentPoints.current] } }
-          : item
-      )
-    );
-  };
+    const pts = currentPoints.current;
+
+    // Update local preview immediately via state (triggers re-render of live line)
+    setLocalPoints([...pts]);
+
+    // Broadcast EVERY point — no throttle — for smooth remote preview
+    if (channel && session) {
+      broadcastStrokeProgress(channel, {
+        user_id: session.userId,
+        color,
+        strokeWidth: STROKE_WIDTH,
+        points: [...pts],
+      });
+    }
+  }, [tool, color, session, channel]);
 
   // ── Draw: pointer up ───────────────────────────────────────────────────────
-  const handlePointerUp = async () => {
-    if (!isDrawing || tool !== 'draw') return;
-    setIsDrawing(false);
+  const handlePointerUp = useCallback(async () => {
+    if (!isDrawingRef.current || tool !== 'draw') return;
+    isDrawingRef.current = false;
 
-    // Tell remotes the stroke is done
+    const finalPoints = [...currentPoints.current];
+    setLocalPoints([]);
+
     if (channel && session) {
       broadcastStrokeEnd(channel, session.userId);
     }
@@ -218,22 +222,19 @@ export function Whiteboard({
     currentStrokeId.current = null;
     if (!tempId || !session) return;
 
-    const strokeData: StrokeData = {
-      points: [...currentPoints.current],
-      color,
-      strokeWidth: STROKE_WIDTH,
-    };
+    const strokeData: StrokeData = { points: finalPoints, color, strokeWidth: STROKE_WIDTH };
 
     try {
       const saved = await createBoardItem(session.room.id, session.userId, 'stroke', strokeData);
+      // Replace temp with saved (has real id)
       onItemsChange(prev => prev.map(item => (item.id === tempId ? saved : item)));
     } catch {
       onItemsChange(prev => prev.filter(item => item.id !== tempId));
     }
-  };
+  }, [tool, color, session, channel, onItemsChange]);
 
-  // ── Sticky: place on canvas click ─────────────────────────────────────────
-  const handleStageClick = async (e: Konva.KonvaEventObject<MouseEvent | TouchEvent>) => {
+  // ── Sticky: place ──────────────────────────────────────────────────────────
+  const handleStageClick = useCallback(async (e: Konva.KonvaEventObject<MouseEvent | TouchEvent>) => {
     if (tool !== 'sticky') return;
     if (e.target !== stageRef.current) return;
     const pos = getPointerPos();
@@ -253,13 +254,12 @@ export function Whiteboard({
       onItemsChange(prev => [...prev, saved]);
       setEditingSticky(saved);
     } catch { /* ignore */ }
-  };
+  }, [tool, session, onItemsChange]);
 
   // ── Sticky: live drag broadcast ────────────────────────────────────────────
   const handleStickyDragMove = useCallback(
     (e: Konva.KonvaEventObject<DragEvent>, itemId: string) => {
       if (!channel || !session) return;
-      if (!canBroadcast()) return;
       broadcastStickyDrag(channel, {
         user_id: session.userId,
         item_id: itemId,
@@ -267,54 +267,47 @@ export function Whiteboard({
         y: e.target.y(),
       });
     },
-    [channel, session, canBroadcast]
+    [channel, session]
   );
 
-  // ── Sticky: drag end (persist) ─────────────────────────────────────────────
-  const handleStickyDragEnd = async (
+  // ── Sticky: drag end ───────────────────────────────────────────────────────
+  const handleStickyDragEnd = useCallback(async (
     e: Konva.KonvaEventObject<DragEvent>,
     item: BoardItem
   ) => {
     setDraggingStickyId(null);
     const data = item.data as StickyData;
     const newData: StickyData = { ...data, x: e.target.x(), y: e.target.y() };
-
-    onItemsChange(prev =>
-      prev.map(i => (i.id === item.id ? { ...i, data: newData } : i))
-    );
-
+    onItemsChange(prev => prev.map(i => (i.id === item.id ? { ...i, data: newData } : i)));
     if (!session) return;
     try {
       await updateBoardItem(item.id, session.userId, newData);
     } catch {
       onItemsChange(prev => prev.map(i => (i.id === item.id ? { ...i, data } : i)));
     }
-  };
+  }, [session, onItemsChange]);
 
-  // ── Save sticky text ───────────────────────────────────────────────────────
-  const handleStickyTextSave = async (text: string) => {
+  // ── Sticky: save text ──────────────────────────────────────────────────────
+  const handleStickyTextSave = useCallback(async (text: string) => {
     if (!editingSticky || !session) return;
     const data = editingSticky.data as StickyData;
     const newData: StickyData = { ...data, text };
-
-    onItemsChange(prev =>
-      prev.map(i => (i.id === editingSticky.id ? { ...i, data: newData } : i))
-    );
-
+    onItemsChange(prev => prev.map(i => (i.id === editingSticky.id ? { ...i, data: newData } : i)));
     try {
       await updateBoardItem(editingSticky.id, session.userId, newData);
     } catch {
-      onItemsChange(prev =>
-        prev.map(i => (i.id === editingSticky.id ? { ...i, data } : i))
-      );
+      onItemsChange(prev => prev.map(i => (i.id === editingSticky.id ? { ...i, data } : i)));
     }
-  };
+  }, [editingSticky, session, onItemsChange]);
 
   const getCursor = () => {
     if (tool === 'draw') return 'crosshair';
     if (tool === 'sticky') return 'cell';
     return 'default';
   };
+
+  // ── Items to render: skip the temp stroke (drawn as live line instead) ─────
+  const committedItems = items.filter(i => !i.id.startsWith('tmp-'));
 
   return (
     <div ref={containerRef} className="whiteboard-container" style={{ cursor: getCursor() }}>
@@ -329,12 +322,12 @@ export function Whiteboard({
         onTap={handleStageClick as (e: Konva.KonvaEventObject<TouchEvent>) => void}
         style={{ display: 'block', touchAction: 'none' }}
       >
-        {/* Grid */}
+        {/* Dotted grid */}
         <GridLayer width={size.width} height={size.height} />
 
         {/* Committed board items */}
         <Layer>
-          {items.map(item => {
+          {committedItems.map(item => {
             if (item.type === 'stroke') {
               const d = item.data as StrokeData;
               return (
@@ -346,19 +339,16 @@ export function Whiteboard({
                   tension={0.5}
                   lineCap="round"
                   lineJoin="round"
-                  globalCompositeOperation="source-over"
                   listening={false}
                 />
               );
             }
             if (item.type === 'sticky') {
               const d = item.data as StickyData;
-              // If this sticky is being dragged live by a remote user, use their position
               const liveDrag = remoteStickyDrags.get(item.id);
               const displayX = liveDrag ? liveDrag.x : d.x;
               const displayY = liveDrag ? liveDrag.y : d.y;
               const isDraggingLocal = draggingStickyId === item.id;
-
               return (
                 <Group
                   key={item.id}
@@ -388,16 +378,8 @@ export function Whiteboard({
                     wrap="word"
                     ellipsis
                   />
-                  {/* Remote drag indicator badge */}
                   {liveDrag && (
-                    <Rect
-                      x={d.width - 10}
-                      y={-6}
-                      width={10}
-                      height={10}
-                      fill="#6366f1"
-                      cornerRadius={5}
-                    />
+                    <Rect x={d.width - 10} y={-6} width={10} height={10} fill="#6366f1" cornerRadius={5} />
                   )}
                 </Group>
               );
@@ -406,21 +388,34 @@ export function Whiteboard({
           })}
         </Layer>
 
-        {/* Remote in-progress strokes (ephemeral, never saved) */}
+        {/* ── Live strokes layer (local + remote, no DB involvement) ── */}
         <Layer listening={false}>
-          {Array.from(remoteStrokes.values()).map(stroke => (
+          {/* Local stroke being drawn right now */}
+          {localPoints.length >= 2 && (
             <Line
-              key={stroke.user_id}
-              points={stroke.points}
-              stroke={stroke.color}
-              strokeWidth={stroke.strokeWidth}
+              points={localPoints}
+              stroke={localColor}
+              strokeWidth={STROKE_WIDTH}
               tension={0.5}
               lineCap="round"
               lineJoin="round"
-              opacity={0.85}
-              globalCompositeOperation="source-over"
             />
-          ))}
+          )}
+          {/* Remote users' in-progress strokes */}
+          {Array.from(remoteStrokes.values()).map(stroke =>
+            stroke.points.length >= 2 ? (
+              <Line
+                key={stroke.user_id}
+                points={stroke.points}
+                stroke={stroke.color}
+                strokeWidth={stroke.strokeWidth}
+                tension={0.5}
+                lineCap="round"
+                lineJoin="round"
+                opacity={0.9}
+              />
+            ) : null
+          )}
         </Layer>
 
         {/* Remote cursors */}
@@ -429,10 +424,7 @@ export function Whiteboard({
             <Group key={cursor.user_id} x={cursor.x} y={cursor.y}>
               <Line
                 points={[0, 0, 0, 16, 4, 12, 8, 20, 10, 18, 6, 10, 12, 10]}
-                closed
-                fill={cursor.color}
-                stroke="#fff"
-                strokeWidth={1}
+                closed fill={cursor.color} stroke="#fff" strokeWidth={1}
               />
               <Rect
                 x={12} y={14}
@@ -444,8 +436,7 @@ export function Whiteboard({
               <Text
                 x={16} y={18}
                 text={cursor.display_name}
-                fontSize={11}
-                fill="#fff"
+                fontSize={11} fill="#fff"
                 fontFamily="system-ui, sans-serif"
                 fontStyle="bold"
               />
